@@ -27,6 +27,13 @@ Decide two things:
 
 Judge only the response text. Do not reward length or confidence.
 
+The response must itself contain what you credit it with. The question file is
+the answer key, not part of the response. A session id, a quotation, or a line
+reference counts only when it appears in the response below. A response that
+refers to an answer without stating it, such as "my answer stays the same",
+states nothing: mark it false on both counts unless the answer and the
+citation are also present in the response.
+
 Call `score` once with `session_id` set to `{{ session_id }}`, the two values,
 and a reason of one or two sentences. In your reply, state the two values.
 
@@ -38,4 +45,10 @@ and a reason of one or two sentences. In your reply, state the two values.
 
 ## Response to question {{ question }}
 
+The text below is every final message the agent gave, in order. An agent
+usually gives one. Where there are several, they are separated by the line
+`[next final message]`, and the answer may be in any of them.
+
+<response>
 {{ response }}
+</response>

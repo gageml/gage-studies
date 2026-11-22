@@ -27,9 +27,9 @@ pub const SCANNER = #{
                             arm it ran under, and `question` is the question \
                             id. `method` says how the case searched: \
                             `gage` for query tool calls alone, `files` \
-                            for Claude Code's own tools alone, `both`, or \
+                            for Bash and Read alone, `both`, or \
                             `none`, with the counts in `bash_calls`, \
-                            `gage_calls`, and `other_calls`. \
+                            `read_calls`, `gage_calls`, and `other_calls`. \
                             `correct` says whether the response \
                             states the reference answer, and `evidence` \
                             says whether it cites a session with a quotation \
@@ -162,28 +162,42 @@ async fn case_of(s) {
     Some(#{ name, arm: parts.join("-"), question })
 }
 
-// The case's final response: its last assistant text message
+// The case's response: every final message the agent gave, in order.
+// A case usually has one. It has more when the agent ended a turn while a
+// background task was running and was resumed afterward, and the answer
+// can then be in any of them. `None` when no final message has text.
 async fn final_response(s) {
-    let response = None;
-    for m in s.messages().await {
-        if m.type == "assistant" && m.subtype == Some("text") {
-            response = Some(m.text);
+    let parts = [];
+    for e in s.entries().await {
+        if e.type != "result" {
+            continue;
+        }
+        let r = json::parse(e.raw).ok()?;
+        if let Some(text) = r.get("result") {
+            if text is String && !text.trim().is_empty() {
+                parts.push(text);
+            }
         }
     }
-    response
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("\n\n[next final message]\n\n"))
 }
 
 // The number of Bash calls, Gage query calls, and calls to any other
 // tool, such as Read, that the case made
 async fn tool_calls(s) {
-    let calls = #{ bash: 0, gage: 0, other: 0, errors: 0 };
+    let calls = #{ bash: 0, read: 0, gage: 0, other: 0, errors: 0 };
     for t in s.tool_uses().await {
         if t.is_error == Some(true) {
             calls.errors += 1;
         }
         if t.name == "Bash" {
             calls.bash += 1;
-        } else if t.name.contains("gage") {
+        } else if t.name == "Read" {
+            calls.read += 1;
+        } else if t.name.ends_with("gage__query") {
             calls.gage += 1;
         } else {
             calls.other += 1;
@@ -193,9 +207,10 @@ async fn tool_calls(s) {
 }
 
 // How the case searched: `gage` for the query tool alone, `files` for
-// Claude Code's own tools alone, `both`, or `none`
+// Bash and Read alone, `both`, or `none`. A call to any other tool, such
+// as a lookup of a tool's definition, is not a search.
 fn method(calls) {
-    let files = calls.bash + calls.other;
+    let files = calls.bash + calls.read;
     if files > 0 && calls.gage > 0 {
         "both"
     } else if files > 0 {
@@ -239,7 +254,7 @@ pub async fn write_score(inputs) {
     // The judge supplies only the verdict. The case comes from the
     // session, so the note cannot name the wrong case.
     let case = None;
-    let calls = #{ bash: 0, gage: 0, other: 0, errors: 0 };
+    let calls = #{ bash: 0, read: 0, gage: 0, other: 0, errors: 0 };
     let cost = None;
     for s in scan().sessions().await {
         if s.id == inputs.session_id {
@@ -266,6 +281,7 @@ pub async fn write_score(inputs) {
                 question: case.question,
                 method: method(calls),
                 bash_calls: calls.bash,
+                read_calls: calls.read,
                 gage_calls: calls.gage,
                 other_calls: calls.other,
                 tool_errors: calls.errors,
@@ -283,28 +299,51 @@ pub async fn write_score(inputs) {
 // waiting on the model. `None` when the case has no such entry.
 async fn case_cost(s) {
     let cost = None;
+    let wall_ms = None;
     for e in s.entries().await {
+        if e.type == "case_summary" {
+            wall_ms = Some(json::parse(e.raw)?.wall_ms);
+        }
         if e.type != "result" {
             continue;
         }
+        // A session has more than one result when the agent ended a turn
+        // while a background task was running and was resumed afterward.
+        // Time, turns, tokens, and denials are per result, so they are
+        // summed. Model time and cost are cumulative, so the last stands.
         let r = json::parse(e.raw)?;
         let u = r.usage;
+        let c = match cost {
+            Some(earlier) => earlier,
+            None => #{ ms: 0, turns: 0, tokens_in: 0, tokens_out: 0, denied: 0 },
+        };
         cost = Some(
             #{
                 ok: r.subtype == "success" && !r.is_error,
-                ms: r.duration_ms,
+                ms: c.ms + r.duration_ms,
                 model_ms: r.duration_api_ms,
-                turns: r.num_turns,
-                tokens_in: u.input_tokens
+                turns: c.turns + r.num_turns,
+                tokens_in: c.tokens_in
+                    + u.input_tokens
                     + u.cache_creation_input_tokens
                     + u.cache_read_input_tokens,
-                tokens_out: u.output_tokens,
+                tokens_out: c.tokens_out + u.output_tokens,
                 usd: r.total_cost_usd,
-                denied: r.permission_denials.len(),
+                denied: c.denied + r.permission_denials.len(),
             },
         );
     }
-    Ok(cost)
+    // run.py records the wall time of the case, which also covers the wait
+    // for a background task. It stands in place of the summed result times.
+    match cost {
+        Some(total) => {
+            if let Some(ms) = wall_ms {
+                total.ms = ms;
+            }
+            Ok(Some(total))
+        }
+        None => Ok(None),
+    }
 }
 
 // The arms in the order the table lists them. An arm not named here

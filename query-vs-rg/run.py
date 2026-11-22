@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Answer questions from questions.toml by searching past sessions, once per arm.
 
-Usage: run.py --dataset DIR [--arm ARM] [-d TEXT] (N | --all)    start a new run
-       run.py --run ID [--arm ARM] [N | --all]    resume or extend a run
+Usage: run.py --dataset DIR [--arm ARM] [-d TEXT] (N... | --all)    start a new run
+       run.py --run ID [--arm ARM] [N... | --all]    resume or extend a run
        run.py --list                              list the runs
 
 A run is one pass over a set of questions. It has an ID and a directory,
@@ -15,9 +15,11 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import tomllib
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -90,7 +92,7 @@ def sandbox(cmd: list[str], dataset: Path, empty_file: str, empty_dir: str) -> l
     answers = [
         HERE / "questions.toml",
         # responses to the same questions, from this run and from others
-        RUNS,
+        *HERE.glob("runs*"),
         *HERE.glob("projects*"),
     ]
     for path in answers:
@@ -111,11 +113,11 @@ def parse_args() -> argparse.Namespace:
         description="Answer questions by searching past sessions, once per arm."
     )
     ap.add_argument(
-        "question",
+        "questions",
         type=int,
-        nargs="?",
+        nargs="*",
         metavar="N",
-        help="question index in questions.toml",
+        help="question index in questions.toml (repeatable)",
     )
     ap.add_argument("-a", "--all", action="store_true", help="run every question")
     ap.add_argument(
@@ -137,11 +139,20 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="dataset directory for a new run, as built by make_dataset.py",
     )
+    ap.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help="cases to run at once (default: 1). Cases run at once compete "
+        "for the machine, so their times are not valid measurements.",
+    )
     ap.add_argument("--list", action="store_true", help="list the runs and exit")
     args = ap.parse_args()
     if args.list:
         return args
-    if args.question is None and not args.all and not args.run:
+    if not args.questions and not args.all and not args.run:
         ap.error("give a question index, --all, or --run ID")
     if args.run and (args.description or args.dataset):
         ap.error("--description and --dataset apply to a new run only")
@@ -207,17 +218,26 @@ def session_dir(run: dict, arm: str, index: int) -> Path:
     return RUNS / run["id"] / "projects" / f"{arm}-{index}"
 
 
-def result_of(session: Path) -> dict | None:
-    """The final result event of a session file, or None when the session
-    did not finish."""
-    for line in reversed(session.read_text().splitlines()):
+def results_of(session: Path) -> list[dict]:
+    """The result events of a session file, in order. A session has more
+    than one when the agent ended a turn while a background task was still
+    running and Claude Code resumed it afterward."""
+    results = []
+    for line in session.read_text().splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
         if event.get("type") == "result":
-            return event
-    return None
+            results.append(event)
+    return results
+
+
+def result_of(session: Path) -> dict | None:
+    """The final result event of a session file, or None when the session
+    did not finish."""
+    results = results_of(session)
+    return results[-1] if results else None
 
 
 def failure_of(result: dict | None) -> str | None:
@@ -238,6 +258,9 @@ def is_done(run: dict, arm: str, index: int) -> bool:
     )
 
 
+LOG_LOCK = threading.Lock()
+
+
 def log(run: dict, event: str, **fields) -> None:
     """Append one event to the run's log, runs/<ID>/log.jsonl. The log is the
     record of what the script did: each invocation, each case with its
@@ -247,7 +270,7 @@ def log(run: dict, event: str, **fields) -> None:
         "event": event,
         **fields,
     }
-    with (RUNS / run["id"] / "log.jsonl").open("a") as f:
+    with LOG_LOCK, (RUNS / run["id"] / "log.jsonl").open("a") as f:
         f.write(json.dumps(entry) + "\n")
 
 
@@ -348,7 +371,9 @@ def ask(run: dict, arm: str, index: int, question: str) -> bool:
     reason = failure_of(result)
     if reason is None and proc.returncode != 0:
         reason = f"claude exited with status {proc.returncode}"
-    calls = {"bash": 0, "gage": 0, "other": 0}
+    # Bash and Read search the session files. A Gage call is a query. Any
+    # other tool, such as a lookup of a tool's definition, is not a search.
+    calls = {"bash": 0, "read": 0, "gage": 0, "other": 0}
     tool_errors = 0
     for line in session.read_text().splitlines():
         try:
@@ -367,17 +392,28 @@ def ask(run: dict, arm: str, index: int, question: str) -> bool:
                 calls[kind if kind in calls else "other"] += 1
             elif block.get("type") == "tool_result" and block.get("is_error"):
                 tool_errors += 1
+    # Turns, tokens, and denials are reported per result event, so they are
+    # summed. The cost is cumulative, so the last one stands.
+    results = results_of(session)
     result = result or {}
-    usage = result.get("usage") or {}
+    turns = sum(r.get("num_turns") or 0 for r in results)
     tokens_in = sum(
-        usage.get(k, 0)
+        (r.get("usage") or {}).get(k, 0)
+        for r in results
         for k in (
             "input_tokens",
             "cache_creation_input_tokens",
             "cache_read_input_tokens",
         )
     )
-    denied = len(result.get("permission_denials") or [])
+    tokens_out = sum((r.get("usage") or {}).get("output_tokens", 0) for r in results)
+    denied = sum(len(r.get("permission_denials") or []) for r in results)
+    # The session file states its own wall time, which no result event
+    # holds: a result leaves out the wait for a background task. The score
+    # scanner reads this entry.
+    with session.open("a") as out:
+        summary = {"type": "case_summary", "wall_ms": round(wall * 1000)}
+        out.write(json.dumps(summary) + "\n")
     log(
         run,
         "case",
@@ -388,9 +424,9 @@ def ask(run: dict, arm: str, index: int, question: str) -> bool:
         reason=reason,
         exit=proc.returncode,
         seconds=round(wall, 1),
-        turns=result.get("num_turns"),
+        turns=turns,
         tokens_in=tokens_in,
-        tokens_out=usage.get("output_tokens"),
+        tokens_out=tokens_out,
         usd=result.get("total_cost_usd"),
         calls=calls,
         # a tool error is a call that returned an error; a denied call is one
@@ -406,11 +442,13 @@ def ask(run: dict, arm: str, index: int, question: str) -> bool:
         print(f"{label}: FAILED after {wall:.0f}s: {reason}; see {session}")
         return False
     print(
-        f"{label}: {wall:.0f}s, {result.get('num_turns', 0)} turns, "
-        f"{tokens_in} tokens in, {usage.get('output_tokens', 0)} tokens out, "
+        f"{label}: {wall:.0f}s, {turns} turns, "
+        f"{tokens_in} tokens in, {tokens_out} tokens out, "
         f"${result.get('total_cost_usd', 0):.2f}, "
-        f"{calls['bash']} Bash, {calls['gage']} Gage, {calls['other']} other calls, "
-        f"{tool_errors} tool errors of which {denied} denied"
+        f"{calls['bash']} Bash, {calls['read']} Read, {calls['gage']} Gage, "
+        f"{calls['other']} other calls, "
+        f"{tool_errors} tool errors of which {denied} denied",
+        flush=True,
     )
     return True
 
@@ -432,10 +470,11 @@ def main() -> None:
     # for what the run already holds.
     if args.all:
         asked = list(questions)
-    elif args.question is not None:
-        if args.question not in questions:
-            raise SystemExit(f"questions.toml has no question {args.question}")
-        asked = [args.question]
+    elif args.questions:
+        unknown = [q for q in args.questions if q not in questions]
+        if unknown:
+            raise SystemExit(f"questions.toml has no question {unknown[0]}")
+        asked = list(dict.fromkeys(args.questions))
     else:
         asked = list(run["questions"])
     arms = [args.arm] if args.arm else (run["arms"] or list(ARMS))
@@ -446,16 +485,21 @@ def main() -> None:
     write_run(run)
 
     print(f"Run {run['id']}")
-    log(run, "invoked", questions=asked, arms=arms)
+    log(run, "invoked", questions=asked, arms=arms, jobs=args.jobs)
     counts = {"ok": 0, "failed": 0, "already done": 0}
+    todo = []
     for index in asked:
         for arm in arms:
             if is_done(run, arm, index):
                 counts["already done"] += 1
-            elif ask(run, arm, index, questions[index]):
-                counts["ok"] += 1
             else:
-                counts["failed"] += 1
+                todo.append((arm, index))
+    # Cases run at once compete for the machine, so their times are longer
+    # than those of cases run one at a time. The log records the job count.
+    with ThreadPoolExecutor(max(1, args.jobs)) as pool:
+        outcomes = pool.map(lambda c: ask(run, c[0], c[1], questions[c[1]]), todo)
+        for completed in outcomes:
+            counts["ok" if completed else "failed"] += 1
 
     # The state of the whole run, not only of what this invocation asked for
     missing = [

@@ -8,8 +8,7 @@ I can't figure out why. Why not just tell the agent what to query with SQL
 examples if needed?"""
 
 answer = """
-A view narrows what an agent needs to query and simplifies the SQL. The answer
-can be found in sessions 26e793bf, 70db3cbd, and bb5959f5.
+A view narrows what an agent needs to query and simplifies the SQL.
 """
 
 sessions = [
@@ -199,7 +198,7 @@ sessions = ["10a612db", "1e63bp9x"]
 id = 15
 
 question = """
-Early on adding a lot of sessions to forever why was that?
+Early on adding a lot of sessions took forever why was that?
 """
 
 answer = """
@@ -265,6 +264,6 @@ question = """
 When did we start the Pi driver effort?
 """
 
-answer = "November 20, 2026"
+answer = "November 17, 2026"
 
-sessions = ["113509cd", "6pcf8agq"]
+sessions = ["13sreqya", "ad98dab2", "a146f5ef", "4z0k3vf3", "d6371080", "771ed0s6"]
