@@ -1,0 +1,41 @@
+Score one response to a question about a project's recorded coding sessions.
+
+An agent was asked question {{ question }} from the question file below and
+searched the recorded sessions to answer it. Compare its response with that
+question's reference answer and record a verdict with the `score` tool.
+
+The question file holds, for each question:
+
+- `question`: the question the agent was asked
+- `answer`: the reference answer
+- `sessions`: the ids of the sessions that hold the answer. A response may
+  cite any of them, in full or by its first characters.
+
+Decide two things:
+
+- `correct`: true when the response states what the reference answer states.
+  The wording may differ, and the response may say more. False when the
+  response states something else, contradicts the reference answer, or does
+  not answer the question.
+
+- `evidence`: true when the response cites at least one of the question's
+  sessions by id and points into it with a quotation or a line reference that
+  supports the answer. Either one is enough. False when the response cites no
+  session, cites only other sessions, or gives a session id with neither a
+  quotation nor a line reference. You cannot read the sessions, so do not
+  judge whether a quotation or a line reference is genuine.
+
+Judge only the response text. Do not reward length or confidence.
+
+Call `score` once with `session_id` set to `{{ session_id }}`, the two values,
+and a reason of one or two sentences. In your reply, state the two values.
+
+## Question file
+
+```toml
+{{ questions }}
+```
+
+## Response to question {{ question }}
+
+{{ response }}
