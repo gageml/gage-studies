@@ -86,6 +86,17 @@ pub async fn score_sessions() {
                 continue;
             }
         };
+        // A case that did not complete is not scored. run.py reports such a
+        // case and keeps the run incomplete until it has been run again.
+        let completed = match case_cost(s).await? {
+            Some(cost) => cost.ok,
+            None => false,
+        };
+        if !completed {
+            log::warn!("skip session {session_id}: the case did not complete");
+            progress.tick();
+            continue;
+        }
         let response = match final_response(s).await {
             Some(response) => response,
             None => {
@@ -101,6 +112,7 @@ pub async fn score_sessions() {
         );
     }
 
+    let failed = 0;
     let results = agents.start();
     while let Some(next) = results.next().await {
         match next {
@@ -115,11 +127,16 @@ pub async fn score_sessions() {
                 );
             }
             Err(err) => {
+                failed += 1;
                 log::error!("agent error: {err:?}");
             }
         }
         progress.tick();
     }
+    if failed > 0 {
+        return Err(format!("{failed} judge agents failed; their cases have no score"));
+    }
+    Ok(())
 }
 
 // The text of the attached question file
@@ -159,8 +176,11 @@ async fn final_response(s) {
 // The number of Bash calls, Gage query calls, and calls to any other
 // tool, such as Read, that the case made
 async fn tool_calls(s) {
-    let calls = #{ bash: 0, gage: 0, other: 0 };
+    let calls = #{ bash: 0, gage: 0, other: 0, errors: 0 };
     for t in s.tool_uses().await {
+        if t.is_error == Some(true) {
+            calls.errors += 1;
+        }
         if t.name == "Bash" {
             calls.bash += 1;
         } else if t.name.contains("gage") {
@@ -219,13 +239,13 @@ pub async fn write_score(inputs) {
     // The judge supplies only the verdict. The case comes from the
     // session, so the note cannot name the wrong case.
     let case = None;
-    let calls = #{ bash: 0, gage: 0 };
+    let calls = #{ bash: 0, gage: 0, other: 0, errors: 0 };
     let cost = None;
     for s in scan().sessions().await {
         if s.id == inputs.session_id {
             case = case_of(s).await;
             calls = tool_calls(s).await;
-            cost = run_cost(s).await?;
+            cost = case_cost(s).await?;
         }
     }
     let cost = cost.unwrap_or(#{});
@@ -248,6 +268,7 @@ pub async fn write_score(inputs) {
                 bash_calls: calls.bash,
                 gage_calls: calls.gage,
                 other_calls: calls.other,
+                tool_errors: calls.errors,
                 correct: inputs.correct,
                 evidence: inputs.evidence,
                 cost,
@@ -260,7 +281,7 @@ pub async fn write_score(inputs) {
 // What the case cost, as Claude Code reports it in the case's final
 // `result` entry: `ms` is the whole case and `model_ms` the part spent
 // waiting on the model. `None` when the case has no such entry.
-async fn run_cost(s) {
+async fn case_cost(s) {
     let cost = None;
     for e in s.entries().await {
         if e.type != "result" {
@@ -270,6 +291,7 @@ async fn run_cost(s) {
         let u = r.usage;
         cost = Some(
             #{
+                ok: r.subtype == "success" && !r.is_error,
                 ms: r.duration_ms,
                 model_ms: r.duration_api_ms,
                 turns: r.num_turns,
@@ -292,6 +314,34 @@ const ARMS = ["default-claude", "with-rg", "with-gage"];
 /// Total the scan's score notes for each arm and write one tally note.
 pub async fn tally() {
     let scores = scan().notes().name("score").await?;
+
+    // Every completed case must have exactly one score. A judge that did
+    // not record its verdict leaves a case without one, and a tally over
+    // the rest would misstate the results.
+    let scored = #{};
+    for n in scores {
+        let name = format!("{}", n.metadata.case);
+        scored.insert(name.clone(), scored.get(name).unwrap_or(0) + 1);
+    }
+    let problems = [];
+    for s in scan().sessions().await {
+        let case = match case_of(s).await {
+            Some(case) => case,
+            None => continue,
+        };
+        let completed = match case_cost(s).await? {
+            Some(cost) => cost.ok,
+            None => false,
+        };
+        let count = scored.get(case.name).unwrap_or(0);
+        if completed && count != 1 {
+            problems.push(format!("{} has {} scores", case.name, count));
+        }
+    }
+    if !problems.is_empty() {
+        return Err(format!("cannot tally: {}", problems.join(", ")));
+    }
+
     let arms = #{};
     let extra = [];
     let with_gage_methods = #{};
@@ -315,6 +365,7 @@ pub async fn tally() {
                     tokens_in: 0,
                     usd: 0.0,
                     denied: 0,
+                    tool_errors: 0,
                 },
             );
             if !ARMS.iter().any(|a| a == arm) {
@@ -323,6 +374,7 @@ pub async fn tally() {
         }
         let a = arms[arm];
         a.cases += 1;
+        a.tool_errors += m.tool_errors;
         if m.correct {
             a.correct += 1;
         }
@@ -347,8 +399,8 @@ pub async fn tally() {
     }
 
     let lines = [
-        "| Arm | Cases | Correct | Evidence | Pass | Seconds | Turns | Tokens in | Cost | Denied |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| Arm | Cases | Correct | Evidence | Pass | Seconds | Turns | Tokens in | Cost | Tool errors | Denied |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ];
     let order = ARMS.iter().collect::<Vec>();
     order.extend(extra);
@@ -358,7 +410,7 @@ pub async fn tally() {
             let n = if a.costed > 0 { a.costed as f64 } else { 1.0 };
             lines.push(
                 format!(
-                    "| {} | {} | {} | {} | {} | {} | {} | {} | ${} | {} |",
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | ${} | {} | {} |",
                     arm,
                     a.cases,
                     a.correct,
@@ -368,6 +420,7 @@ pub async fn tally() {
                     round(a.turns as f64 / n, 10.0),
                     round(a.tokens_in as f64 / n, 1.0),
                     round(a.usd / n, 100.0),
+                    round(a.tool_errors as f64 / a.cases as f64, 10.0),
                     round(a.denied as f64 / n, 10.0),
                 ),
             );
@@ -375,7 +428,8 @@ pub async fn tally() {
     }
     lines.push("");
     lines.push("A pass is a case that is both correct and has evidence.");
-    lines.push("Seconds, turns, tokens in, cost, and denied calls are means per case.");
+    lines.push("Seconds, turns, tokens in, cost, tool errors, and denied calls are means per case.");
+    lines.push("A tool error is a call that returned an error. A denied call is one of them, refused before it ran.");
     for method in ["gage", "files", "both", "none"] {
         if let Some(count) = with_gage_methods.get(method) {
             lines.push(format!("Cases of the with-gage arm that searched with {method}: {count}"));

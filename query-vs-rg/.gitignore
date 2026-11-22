@@ -1,4 +1,4 @@
 projects
 projects-*
 runs
-hidden-sessions.txt
+__pycache__
