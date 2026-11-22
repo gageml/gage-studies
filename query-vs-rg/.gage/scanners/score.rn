@@ -14,18 +14,18 @@ use gage::{
 
 pub const SCANNER = #{
     name: "score",
-    description: "Score each run's response against its question's reference answer",
+    description: "Score each case's response against its question's reference answer",
     tasks: #{
         attach_questions: #{ attaches: ["questions"] },
         score_sessions: #{
             attachments: #{ wants: ["questions"] },
             notes: #{
                 writes: #{
-                    score: "A judge's verdict on one run. The text is the \
-                            run name and the reason. Metadata `run` is \
-                            the run name, as in `rg-1`, `arm` is the \
+                    score: "A judge's verdict on one case. The text is the \
+                            case name and the reason. Metadata `case` is \
+                            the case name, as in `rg-1`, `arm` is the \
                             arm it ran under, and `question` is the question \
-                            id. `method` says how the run searched: \
+                            id. `method` says how the case searched: \
                             `rg` for Bash calls alone, `gage` for query \
                             tool calls alone, `both`, or `none`, with \
                             the counts in `bash_calls` and `gage_calls`. \
@@ -33,7 +33,7 @@ pub const SCANNER = #{
                             states the reference answer, and `evidence` \
                             says whether it cites a session with a quotation \
                             or a line reference. `cost` holds what Claude \
-                            Code reports for the run: `ms`, `model_ms`, \
+                            Code reports for the case: `ms`, `model_ms`, \
                             `turns`, `tokens_in`, `tokens_out`, `usd`, and \
                             `denied`.",
                 },
@@ -45,13 +45,13 @@ pub const SCANNER = #{
                 writes: #{
                     tally: "The scan's totals for each arm. The text is a \
                             table. Metadata `arms` holds, for each arm, \
-                            the counts `runs`, `correct`, `evidence`, and \
-                            `pass`, where a pass is a run that is both \
+                            the counts `cases`, `correct`, `evidence`, and \
+                            `pass`, where a pass is a case that is both \
                             correct and has evidence. Metadata \
-                            `both_methods` counts the runs of the `both` \
+                            `both_methods` counts the cases of the `both` \
                             arm by search method. Each arm also holds the \
                             sums `ms`, `turns`, `tokens_in`, `usd`, and \
-                            `denied` over its `costed` runs.",
+                            `denied` over its `costed` cases.",
                 },
             },
         },
@@ -74,8 +74,8 @@ pub async fn score_sessions() {
 
     for s in sessions {
         let session_id = s.id;
-        let question = match run_of(s).await {
-            Some(run) => run.question,
+        let question = match case_of(s).await {
+            Some(case) => case.question,
             None => {
                 log::info!(
                     "skip session {session_id}: project is not <arm>-<question>"
@@ -130,10 +130,10 @@ async fn questions_text() {
     Err(format!("no attachment holds {QUESTIONS}"))
 }
 
-// The run a session records. A run's project is `<arm>-<question>`,
-// as in `rg-1` or `rg-hint-1`, which is also the run's name. The
+// The case a session records. A case's project is `<arm>-<question>`,
+// as in `rg-1` or `rg-hint-1`, which is also the case's name. The
 // question is what follows the last `-`, and the arm is the rest.
-async fn run_of(s) {
+async fn case_of(s) {
     let name = s.attrs().await.project?;
     let parts = name.split('-').collect::<Vec>();
     if parts.len() < 2 {
@@ -143,7 +143,7 @@ async fn run_of(s) {
     Some(#{ name, arm: parts.join("-"), question })
 }
 
-// The run's final response: its last assistant text message
+// The case's final response: its last assistant text message
 async fn final_response(s) {
     let response = None;
     for m in s.messages().await {
@@ -154,7 +154,7 @@ async fn final_response(s) {
     response
 }
 
-// The number of Bash calls and Gage query calls the run made
+// The number of Bash calls and Gage query calls the case made
 async fn tool_calls(s) {
     let calls = #{ bash: 0, gage: 0 };
     for t in s.tool_uses().await {
@@ -167,7 +167,7 @@ async fn tool_calls(s) {
     calls
 }
 
-// How the run searched: `rg` for Bash alone, `gage` for the query tool
+// How the case searched: `rg` for Bash alone, `gage` for the query tool
 // alone, `both`, or `none`
 fn method(calls) {
     if calls.bash > 0 && calls.gage > 0 {
@@ -210,34 +210,34 @@ fn score_tool() {
 }
 
 pub async fn write_score(inputs) {
-    // The judge supplies only the verdict. The run comes from the
-    // session, so the note cannot name the wrong run.
-    let run = None;
+    // The judge supplies only the verdict. The case comes from the
+    // session, so the note cannot name the wrong case.
+    let case = None;
     let calls = #{ bash: 0, gage: 0 };
     let cost = None;
     for s in scan().sessions().await {
         if s.id == inputs.session_id {
-            run = run_of(s).await;
+            case = case_of(s).await;
             calls = tool_calls(s).await;
             cost = run_cost(s).await?;
         }
     }
     let cost = cost.unwrap_or(#{});
-    let run = match run {
-        Some(run) => run,
+    let case = match case {
+        Some(case) => case,
         None => {
             return Ok(
-                format!("error: `{}` is not a run of this scan", inputs.session_id),
+                format!("error: `{}` is not a case of this scan", inputs.session_id),
             );
         }
     };
-    let note = write_note("score", format!("{}: {}", run.name, inputs.reason))
+    let note = write_note("score", format!("{}: {}", case.name, inputs.reason))
         .target(Target::session(inputs.session_id))
         .metadata(
             #{
-                run: run.name,
-                arm: run.arm,
-                question: run.question,
+                case: case.name,
+                arm: case.arm,
+                question: case.question,
                 method: method(calls),
                 bash_calls: calls.bash,
                 gage_calls: calls.gage,
@@ -250,9 +250,9 @@ pub async fn write_score(inputs) {
     Ok(format!("Wrote score note {}", note.id))
 }
 
-// What the run cost, as Claude Code reports it in the run's final
-// `result` entry: `ms` is the whole run and `model_ms` the part spent
-// waiting on the model. `None` when the run has no such entry.
+// What the case cost, as Claude Code reports it in the case's final
+// `result` entry: `ms` is the whole case and `model_ms` the part spent
+// waiting on the model. `None` when the case has no such entry.
 async fn run_cost(s) {
     let cost = None;
     for e in s.entries().await {
@@ -298,7 +298,7 @@ pub async fn tally() {
             arms.insert(
                 arm.clone(),
                 #{
-                    runs: 0,
+                    cases: 0,
                     correct: 0,
                     evidence: 0,
                     pass: 0,
@@ -315,7 +315,7 @@ pub async fn tally() {
             }
         }
         let a = arms[arm];
-        a.runs += 1;
+        a.cases += 1;
         if m.correct {
             a.correct += 1;
         }
@@ -340,20 +340,20 @@ pub async fn tally() {
     }
 
     let lines = [
-        "| Arm | Runs | Correct | Evidence | Pass | Seconds | Turns | Tokens in | Cost | Denied |",
+        "| Arm | Cases | Correct | Evidence | Pass | Seconds | Turns | Tokens in | Cost | Denied |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ];
     let order = ARMS.iter().collect::<Vec>();
     order.extend(extra);
     for arm in order {
         if let Some(a) = arms.get(arm) {
-            // Means over the runs that report a cost
+            // Means over the cases that report a cost
             let n = if a.costed > 0 { a.costed as f64 } else { 1.0 };
             lines.push(
                 format!(
                     "| {} | {} | {} | {} | {} | {} | {} | {} | ${} | {} |",
                     arm,
-                    a.runs,
+                    a.cases,
                     a.correct,
                     a.evidence,
                     a.pass,
@@ -367,11 +367,11 @@ pub async fn tally() {
         }
     }
     lines.push("");
-    lines.push("A pass is a run that is both correct and has evidence.");
-    lines.push("Seconds, turns, tokens in, cost, and denied calls are means per run.");
+    lines.push("A pass is a case that is both correct and has evidence.");
+    lines.push("Seconds, turns, tokens in, cost, and denied calls are means per case.");
     for method in ["rg", "gage", "both", "none"] {
         if let Some(count) = both_methods.get(method) {
-            lines.push(format!("Runs of the both arm that searched with {method}: {count}"));
+            lines.push(format!("Cases of the both arm that searched with {method}: {count}"));
         }
     }
 
