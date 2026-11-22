@@ -1,0 +1,270 @@
+[[question]]
+
+id = 1
+
+question = """
+We recently added support for scanner query views but for the life of me
+I can't figure out why. Why not just tell the agent what to query with SQL
+examples if needed?"""
+
+answer = """
+A view narrows what an agent needs to query and simplifies the SQL. The answer
+can be found in sessions 26e793bf, 70db3cbd, and bb5959f5.
+"""
+
+sessions = [
+    "26e793bf",
+    "70db3cbd",
+    "bb5959f5",
+    "20aked4g",
+    "1p41s60z",
+    "69hkefym",
+]
+
+[[question]]
+
+id = 2
+
+question = """
+What was the rationale for the no comment rule?
+"""
+
+answer = """
+Comments can be wrong and models will trust them.
+"""
+
+sessions = ["4fb67c34", "4gz64fgp"]
+
+[[question]]
+
+id = 3
+
+question = """
+I'm looking for the session where we discuss tool naming convention.
+"""
+
+answer = """
+The session is d6d6ff42, which is 6753c3sz in the Gage store, titled "Tool
+naming conventions".
+"""
+
+sessions = ["d6d6ff42", "6753c3sz"]
+
+[[question]]
+
+id = 4
+
+question = """
+In a recent session I asked about Cargo cruft and Claude worktree space.
+What was the initial directory usage?
+"""
+
+answer = "306G"
+
+sessions = ["9c627aec", "0xswnanv"]
+
+[[question]]
+
+id = 5
+
+question = """
+What was the template engine we decided on?
+"""
+
+answer = "minijinja"
+
+sessions = ["6ae88839", "1pvmatgh"]
+
+[[question]]
+
+id = 6
+
+question = """
+Did we consider any other progress indicators or just indicatif?
+"""
+
+answer = "ratatui and simpler crates such as linya and pbr came up."
+
+sessions = ["dacdc0e7", "6zhshy5e"]
+
+[[question]]
+
+id = 7
+
+question = """
+What was the rationale for removing hidden-thinking?
+"""
+
+answer = """
+We were under the impression that Anthropic stopped hiding thinking blocks.
+"""
+
+sessions = ["a48e2fe7", "6qtkka95"]
+
+[[question]]
+
+id = 8
+
+question = """
+Why did we rename fetch to pull?
+"""
+
+answer = """
+fetch was acting like Git pull, rather than Git fetch. Once renamed, we
+added a true fetch command, which copied remote references. Later merge
+was added.
+"""
+
+sessions = ["a061ebaf", "403pzkkh"]
+
+[[question]]
+
+id = 9
+
+question = """
+When we added --since to gage session find, did it filter by session time or
+by message time?
+"""
+
+answer = "Session time only. No message level time filters."
+
+sessions = ["e8069cf6", "5np19mm3"]
+
+[[question]]
+
+id = 10
+
+question = """
+What was the problem with the ->> JSON operator in DataFusion?
+"""
+
+answer = "It binds with lower precedence than comparison operators such as =."
+
+sessions = ["dad2cbe4", "000d5nm2"]
+
+[[question]]
+
+id = 11
+
+question = """
+I recall fetch was hanging - remind what was the root cause?
+"""
+
+answer = "The hang was the password prompt"
+
+sessions = ["36c381d9", "0aznpw7t"]
+
+[[question]]
+
+id = 12
+
+question = """
+Which long running branch did I decide to stop using in favor of pull requests?
+"""
+
+answer = "gar1t-dev"
+
+sessions = ["ebdeeeca", "4xzt64zs"]
+
+[[question]]
+
+id = 13
+
+question = """
+I'm looking for the session where I asked why Claude used grep instead of Gage
+query to search session history.
+"""
+
+answer = """
+The session is 02ac7a00, which is 6wmpdvep in the Gage store, titled "Gage
+query vs filesystem tools".
+"""
+
+sessions = ["02ac7a00", "6wmpdvep"]
+
+[[question]]
+
+id = 14
+
+question = """
+What do we call running a scan with --from <scan>?
+"""
+
+answer = "Rescan"
+
+sessions = ["10a612db", "1e63bp9x"]
+
+[[question]]
+
+id = 15
+
+question = """
+Early on adding a lot of sessions to forever why was that?
+"""
+
+answer = """
+Slow phase before the progress bar is a quadratic directory  walk in the
+Claude driver, run twice per selected session.
+"""
+
+sessions = ["2bd2c501", "4eeqpa4t"]
+
+[[question]]
+
+id = 16
+
+question = """
+What happened to the CRUD CLI for publish?
+"""
+
+answer = "The CLI got too complex, so the publish definition moved to a jsonc file."
+
+sessions = ["bc1b408b", "03desznf"]
+
+[[question]]
+
+id = 17
+
+question = """
+What naming convention did I choose for bug fix branches in treemd?
+"""
+
+answer = "fix-xxx"
+
+sessions = ["a4883904", "4sexd2ne"]
+
+[[question]]
+
+id = 18
+
+question = """
+Is there a rhyme or reason for the async/not async split in the runtime?
+"""
+
+answer = "Anything that does I/O or has a side effect is async."
+
+sessions = ["b0a1582b", "33yf1aee", "70db3cbd", "1p41s60z"]
+
+[[question]]
+
+id = 19
+
+question = """
+What was the impetus for the big schema rethink?
+"""
+
+answer = "To enable collaboration and sharing."
+
+sessions = ["1f4d9087", "6dhd7ahp"]
+
+[[question]]
+
+id = 20
+
+question = """
+When did we start the Pi driver effort?
+"""
+
+answer = "November 20, 2026"
+
+sessions = ["113509cd", "6pcf8agq"]
