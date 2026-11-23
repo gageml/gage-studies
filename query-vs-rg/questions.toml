@@ -72,7 +72,16 @@ What was the template engine we decided on?
 
 answer = "minijinja"
 
-sessions = ["6ae88839", "1pvmatgh"]
+sessions = [
+    "6ae88839",
+    "1pvmatgh",
+    "dfae3235",
+    "71r4m2ce",
+    "cb340fd6",
+    "30hgqsjx",
+    "8448f0e5",
+    "2y38bp2q",
+]
 
 [[question]]
 
@@ -139,7 +148,14 @@ What was the problem with the ->> JSON operator in DataFusion?
 
 answer = "It binds with lower precedence than comparison operators such as =."
 
-sessions = ["dad2cbe4", "000d5nm2"]
+sessions = [
+    "dad2cbe4",
+    "000d5nm2",
+    "632b5dc8",
+    "7t7jp28j",
+    "02ac7a00",
+    "6wmpdvep",
+]
 
 [[question]]
 
@@ -216,9 +232,9 @@ question = """
 What happened to the CRUD CLI for publish?
 """
 
-answer = "The CLI got too complex, so the publish definition moved to a jsonc file."
+answer = "It was replaced with a single edit command that opens a jsonc file."
 
-sessions = ["bc1b408b", "03desznf"]
+sessions = ["bc1b408b", "03desznf", "7387b004", "4hxc9v12"]
 
 [[question]]
 
@@ -242,7 +258,16 @@ Is there a rhyme or reason for the async/not async split in the runtime?
 
 answer = "Anything that does I/O or has a side effect is async."
 
-sessions = ["b0a1582b", "33yf1aee", "70db3cbd", "1p41s60z"]
+sessions = [
+    "b0a1582b",
+    "33yf1aee",
+    "70db3cbd",
+    "1p41s60z",
+    "26bbd6dc",
+    "1e5gnx3x",
+    "086672a7",
+    "4d8yww4a",
+]
 
 [[question]]
 
@@ -254,7 +279,14 @@ What was the impetus for the big schema rethink?
 
 answer = "To enable collaboration and sharing."
 
-sessions = ["1f4d9087", "6dhd7ahp"]
+sessions = [
+    "1f4d9087",
+    "6dhd7ahp",
+    "d5905397",
+    "317kqvmm",
+    "76c75513",
+    "2sy8nhc1",
+]
 
 [[question]]
 
