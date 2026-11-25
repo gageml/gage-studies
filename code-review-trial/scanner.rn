@@ -1,0 +1,577 @@
+use gage::{
+    AgentRunner,
+    Input,
+    Progress,
+    Target,
+    Template,
+    Tool,
+    call_agent,
+    params,
+    scan,
+    tools::Query,
+    write_note,
+};
+
+pub const SCANNER = #{
+    name: "code-review-trial",
+    description: "Review a commit with and without the session that wrote it",
+    // The id of one condition to run. Every condition runs when it is
+    // empty.
+    params: #{ condition: "" },
+    tasks: #{
+        review_commits: #{
+            attachments: #{ needs: ["commit-tree"] },
+            notes: #{
+                writes: #{
+                    "diff-only[claim]": include_str!("claim-note-doc.md"),
+                    "session[claim]": include_str!("claim-note-doc.md"),
+                    "diff-only[guess]": include_str!("guess-note-doc.md"),
+                    "session[guess]": include_str!("guess-note-doc.md"),
+                    "diff-only[run]": include_str!("run-note-doc.md"),
+                    "session[run]": include_str!("run-note-doc.md"),
+                },
+            },
+        },
+    },
+};
+
+// The repository as of one commit, written by `prepare.py` and
+// attached out of band. The files under `.trial/` are the commit's
+// diff, message, and session.
+const COMMIT_TREE = "commit-tree";
+const TRIAL_DIR = ".trial/";
+
+// Every reviewer runs on the same model so that a difference between
+// two reviewers comes from the condition alone
+const MODEL = "large";
+
+// Lines of unchanged text around each change, as `prepare.py` wrote
+// the diff
+const DIFF_CONTEXT = 10;
+
+const SEVERITIES = ["wrong-result", "data-loss", "unhandled-input", "rule"];
+
+// The most lines `read_file` returns and the most matches `search`
+// returns in one call
+const READ_LIMIT = 400;
+const SEARCH_LIMIT = 60;
+
+// The conditions. A condition with `record` reads the session that
+// wrote the commit. Each condition has its own `claim` and `guess`
+// tools, which write the notes named for it, so a reviewer cannot
+// record under the other condition.
+fn conditions() {
+    [
+        #{
+            id: "diff-only",
+            record: false,
+            claim: Tool::new("claim", write_diff_only_claim),
+            guess: Tool::new("guess", write_diff_only_guess),
+        },
+        #{
+            id: "session",
+            record: true,
+            claim: Tool::new("claim", write_session_claim),
+            guess: Tool::new("guess", write_session_guess),
+        },
+    ]
+}
+
+pub async fn review_commits() {
+    let t = Template::new(include_str!("reviewer-prompt.md.j2"))?;
+
+    let commits = scan().attachments().name(COMMIT_TREE).await?;
+    let only = params().condition;
+    let conditions = conditions()
+        .iter()
+        .filter(|c| only.is_empty() || c.id == only)
+        .collect::<Vec>();
+    if conditions.is_empty() {
+        return Err(format!("no condition has the id `{only}`"));
+    }
+    let progress = Progress::new(commits.len() * conditions.len());
+    let agents = AgentRunner::new();
+
+    for a in commits {
+        let commit = trial_file(a, "commit.json").await?.json()?;
+        let diff = trial_file(a, "diff.patch").await?.text()?;
+        let message = trial_file(a, "message.txt").await?.text()?;
+        for c in conditions {
+            let prompt = t.render(#{
+                attachment_id: a.id,
+                message: message.trim(),
+                diff: diff.trim(),
+                context: DIFF_CONTEXT,
+                record: c.record,
+                session_id: commit.session_id,
+                session_end: commit.session_end,
+            });
+            let agent = call_agent(prompt)
+                .name("code-review-trial")
+                .tools([
+                    list_files_tool(),
+                    read_file_tool(),
+                    search_tool(),
+                    claim_inputs(c.claim),
+                    guess_inputs(c.guess),
+                ])
+                .model(MODEL);
+            // The reviewer reads the record through the query tool,
+            // which is limited to the session lines before the commit
+            let agent = if c.record {
+                agent.tool(
+                    Query::new()
+                        .session(commit.session_id)
+                        .range(1, commit.session_end),
+                )
+            } else {
+                agent
+            };
+            agents.add(
+                agent,
+                #{
+                    condition: c.id,
+                    attachment_id: a.id,
+                    commit: commit.commit,
+                },
+            );
+        }
+    }
+
+    let results = agents.start();
+    while let Some(next) = results.next().await {
+        match next {
+            Ok((result, #{ condition, attachment_id, commit })) => {
+                let metadata = result.metadata();
+                metadata.commit = commit;
+                metadata.model = MODEL;
+                log::info!("reviewer done: {:?}", #{ condition, commit, metadata });
+                write_note(format!("{condition}[run]"), result.text)
+                    .target(Target::attachment(attachment_id))
+                    .metadata(metadata)
+                    .await?;
+            }
+            Err(err) => {
+                log::error!("agent error: {err:?}");
+            }
+        }
+        progress.tick();
+    }
+    Ok(())
+}
+
+// One file that `prepare.py` wrote for the commit
+async fn trial_file(attachment, name) {
+    match attachment.file(format!("{TRIAL_DIR}{name}")).await {
+        Some(f) => Ok(f),
+        None => Err(format!(
+            "attachment {} has no {TRIAL_DIR}{name}; run prepare.py for the commit",
+            attachment.id
+        )),
+    }
+}
+
+async fn commit_tree(attachment_id) {
+    for a in scan().attachments().name(COMMIT_TREE).await? {
+        if a.id == attachment_id {
+            return Ok(Some(a));
+        }
+    }
+    Ok(None)
+}
+
+fn unknown_attachment(attachment_id) {
+    format!("error: unknown attachment_id `{attachment_id}`")
+}
+
+// True for a path a reviewer may read. The files under `.trial/` name
+// the session, which the `diff-only` reviewer must not learn of.
+fn is_source(path) {
+    !path.starts_with(TRIAL_DIR)
+}
+
+// Text with each run of whitespace as one space, so that a quote
+// matches a line however either one is indented
+fn squash(text) {
+    let words = [];
+    for word in text.replace("\n", " ").replace("\t", " ").split(' ') {
+        if !word.is_empty() {
+            words.push(word);
+        }
+    }
+    words.join(" ")
+}
+
+// A directory path without the slashes at its ends
+fn trim_slashes(path) {
+    let parts = [];
+    for part in path.split('/') {
+        if !part.is_empty() {
+            parts.push(part);
+        }
+    }
+    parts.join("/")
+}
+
+fn attachment_input() {
+    Input::string("attachment_id")
+        .description("The attachment id, exactly as given in the prompt")
+        .required()
+}
+
+fn list_files_tool() {
+    Tool::new("list_files", list_files)
+        .description(
+            "List the paths of the repository's files under a directory. \
+             The result is one path per line.",
+        )
+        .input(attachment_input())
+        .input(
+            Input::string("directory")
+                .description(
+                    "A directory path such as `gage-store/src`. Leave it \
+                     out to list the top-level directories.",
+                ),
+        )
+}
+
+pub async fn list_files(inputs) {
+    let a = match commit_tree(inputs.attachment_id).await? {
+        Some(a) => a,
+        None => return Ok(unknown_attachment(inputs.attachment_id)),
+    };
+    let paths = [];
+    for path in a.files().await {
+        if is_source(path) {
+            paths.push(path);
+        }
+    }
+    let directory = inputs.get("directory").unwrap_or("");
+    let directory = trim_slashes(directory);
+    if directory.is_empty() {
+        // The top level: each directory once with its file count, then
+        // the files
+        let counts = #{};
+        let names = [];
+        let files = [];
+        for path in paths {
+            match path.split_once("/") {
+                Some((top, _)) => {
+                    let count = counts.get(top).unwrap_or(0);
+                    if count == 0 {
+                        names.push(top.clone());
+                    }
+                    counts.insert(top.clone(), count + 1);
+                }
+                None => files.push(path.clone()),
+            }
+        }
+        let out = "";
+        for name in names {
+            let count = counts.get(name.clone()).unwrap_or(0);
+            out += format!("{name}/ ({count} files)\n");
+        }
+        for file in files {
+            out += format!("{file}\n");
+        }
+        return Ok(out);
+    }
+    let prefix = format!("{directory}/");
+    let out = "";
+    for path in paths {
+        if path.starts_with(prefix) {
+            out += format!("{path}\n");
+        }
+    }
+    if out.is_empty() {
+        return Ok(format!("error: no file is under `{directory}`"));
+    }
+    Ok(out)
+}
+
+fn read_file_tool() {
+    Tool::new("read_file", read_file)
+        .description(
+            "Read a file of the repository as it was at the commit. Each \
+             line of the result starts with its line number.",
+        )
+        .input(attachment_input())
+        .input(
+            Input::string("path")
+                .description("The file path, such as `gage-store/src/scan.rs`")
+                .required(),
+        )
+        .input(
+            Input::integer("start")
+                .description("The first line to return. The default is 1."),
+        )
+        .input(
+            Input::integer("end")
+                .description(
+                    "The last line to return. One call returns at most 400 \
+                     lines.",
+                ),
+        )
+}
+
+pub async fn read_file(inputs) {
+    let a = match commit_tree(inputs.attachment_id).await? {
+        Some(a) => a,
+        None => return Ok(unknown_attachment(inputs.attachment_id)),
+    };
+    let lines = match source_lines(a, inputs.path).await? {
+        Some(lines) => lines,
+        None => return Ok(format!("error: no file is at `{}`", inputs.path)),
+    };
+    let total = lines.len();
+    let start = inputs.get("start").unwrap_or(1).max(1);
+    let end = inputs.get("end").unwrap_or(total).min(total);
+    let end = end.min(start + READ_LIMIT - 1);
+    if start > total {
+        return Ok(format!("error: `{}` has {total} lines", inputs.path));
+    }
+    let out = "";
+    let n = start;
+    while n <= end {
+        out += format!("{n}\t{}\n", lines[n - 1]);
+        n += 1;
+    }
+    if end < total {
+        out += format!(
+            "\nLines {start} to {end} of {total}. Call again with `start` \
+             for more.\n"
+        );
+    }
+    Ok(out)
+}
+
+// The lines of the source file at `path`, or `None` when the tree has
+// no such file
+async fn source_lines(attachment, path) {
+    if !is_source(path) {
+        return Ok(None);
+    }
+    match attachment.file(path).await {
+        Some(f) => Ok(Some(f.text()?.split('\n').collect::<Vec>())),
+        None => Ok(None),
+    }
+}
+
+fn search_tool() {
+    Tool::new("search", search)
+        .description(
+            "Find every line of the repository that holds a piece of text. \
+             The match is exact, respects case, and is not a pattern. Each \
+             line of the result is `path:line: text`.",
+        )
+        .input(attachment_input())
+        .input(
+            Input::string("text")
+                .description("The text to find, such as `fn scan_files`")
+                .required(),
+        )
+        .input(
+            Input::string("directory")
+                .description(
+                    "Limit the search to the files under this directory",
+                ),
+        )
+}
+
+pub async fn search(inputs) {
+    let a = match commit_tree(inputs.attachment_id).await? {
+        Some(a) => a,
+        None => return Ok(unknown_attachment(inputs.attachment_id)),
+    };
+    let text = inputs.text;
+    if text.trim().is_empty() {
+        return Ok("error: `text` is empty");
+    }
+    let directory = inputs.get("directory").unwrap_or("");
+    let directory = trim_slashes(directory);
+    let prefix = if directory.is_empty() {
+        ""
+    } else {
+        format!("{directory}/")
+    };
+    let out = "";
+    let found = 0;
+    for path in a.files().await {
+        if !is_source(path) || !path.starts_with(prefix) {
+            continue;
+        }
+        let content = a.file(path).await.unwrap().text()?;
+        if !content.contains(text) {
+            continue;
+        }
+        let n = 0;
+        for line in content.split('\n') {
+            n += 1;
+            if line.contains(text) {
+                found += 1;
+                if found <= SEARCH_LIMIT {
+                    out += format!("{path}:{n}: {}\n", line.trim());
+                }
+            }
+        }
+    }
+    if found == 0 {
+        return Ok(format!("No line holds `{text}`"));
+    }
+    if found > SEARCH_LIMIT {
+        out += format!(
+            "\nThe first {SEARCH_LIMIT} of {found} matches. Search for \
+             longer text, or give a `directory`.\n"
+        );
+    }
+    Ok(out)
+}
+
+// The inputs of a `claim` tool. Both conditions take the same inputs.
+fn claim_inputs(tool) {
+    tool.description("Record one defect that the commit introduces")
+        .input(attachment_input())
+        .input(
+            Input::string("file")
+                .description("The path of the file that holds the defect")
+                .required(),
+        )
+        .input(
+            Input::string("quote")
+                .description(
+                    "One line of the file where the defect is, copied \
+                     exactly",
+                )
+                .required(),
+        )
+        .input(
+            Input::integer("line")
+                .description(
+                    "The number of the quoted line. Required when the quote \
+                     is on more than one line of the file.",
+                ),
+        )
+        .input(
+            Input::string("severity")
+                .description(
+                    "One of: wrong-result, data-loss, unhandled-input, rule",
+                )
+                .required(),
+        )
+        .input(
+            Input::string("description")
+                .description(
+                    "What is wrong, the input or state that shows it, and \
+                     what happens",
+                )
+                .required(),
+        )
+}
+
+pub async fn write_diff_only_claim(inputs) {
+    write_claim("diff-only", inputs).await
+}
+
+pub async fn write_session_claim(inputs) {
+    write_claim("session", inputs).await
+}
+
+async fn write_claim(condition, inputs) {
+    let a = match commit_tree(inputs.attachment_id).await? {
+        Some(a) => a,
+        None => return Ok(unknown_attachment(inputs.attachment_id)),
+    };
+    if !SEVERITIES.iter().any(|s| s == inputs.severity) {
+        return Ok(
+            "error: severity must be wrong-result, data-loss, \
+             unhandled-input, or rule",
+        );
+    }
+    let lines = match source_lines(a, inputs.file).await? {
+        Some(lines) => lines,
+        None => return Ok(format!("error: no file is at `{}`", inputs.file)),
+    };
+    let quote = squash(inputs.quote);
+    if quote.is_empty() {
+        return Ok("error: `quote` is empty");
+    }
+    let at = [];
+    let n = 0;
+    for line in lines {
+        n += 1;
+        if squash(line).contains(quote) {
+            at.push(n);
+        }
+    }
+    if at.is_empty() {
+        return Ok(format!(
+            "error: the quote is not on any line of `{}`. Copy one line \
+             exactly as `read_file` shows it, without its line number, and \
+             call the tool again.",
+            inputs.file
+        ));
+    }
+    let line = match inputs.get("line") {
+        Some(line) => {
+            if !at.iter().any(|n| n == line) {
+                return Ok(format!(
+                    "error: the quote is not on line {line} of `{}`. It is \
+                     on these lines: {at:?}",
+                    inputs.file
+                ));
+            }
+            line
+        }
+        None => {
+            if at.len() > 1 {
+                return Ok(format!(
+                    "error: the quote is on more than one line of `{}`: \
+                     {at:?}. Call the tool again with `line`.",
+                    inputs.file
+                ));
+            }
+            at[0]
+        }
+    };
+    let commit = trial_file(a, "commit.json").await?.json()?;
+    let note = write_note(format!("{condition}[claim]"), inputs.description)
+        .target(Target::attachment(a.id))
+        .metadata(#{
+            commit: commit.commit,
+            file: inputs.file,
+            line,
+            quote,
+            severity: inputs.severity,
+        })
+        .await?;
+    Ok(format!("Recorded claim {}", note.id))
+}
+
+// The inputs of a `guess` tool. Both conditions take the same inputs.
+fn guess_inputs(tool) {
+    tool.description(
+            "Record one place where you had to guess because the \
+             instructions did not say",
+        )
+        .input(attachment_input())
+        .input(Input::string("text").description("What you guessed").required())
+}
+
+pub async fn write_diff_only_guess(inputs) {
+    write_guess("diff-only", inputs).await
+}
+
+pub async fn write_session_guess(inputs) {
+    write_guess("session", inputs).await
+}
+
+async fn write_guess(condition, inputs) {
+    let a = match commit_tree(inputs.attachment_id).await? {
+        Some(a) => a,
+        None => return Ok(unknown_attachment(inputs.attachment_id)),
+    };
+    let note = write_note(format!("{condition}[guess]"), inputs.text)
+        .target(Target::attachment(a.id))
+        .await?;
+    Ok(format!("Recorded guess {}", note.id))
+}

@@ -1,0 +1,112 @@
+Review one commit for defects
+
+You are reviewing one commit to a Rust project. Find the defects that the commit
+introduces and record each one.
+
+You record everything through the tools described below. Your final message is
+not read, so state in it only how many claims you recorded.
+
+## What a defect is
+
+A defect is committed code that is wrong in one of these ways:
+
+- `wrong-result`: the code produces a wrong result.
+- `data-loss`: the code loses or corrupts data.
+- `unhandled-input`: the code fails on an input or a state that it should
+  handle.
+- `rule`: the code breaks a rule that the project's `CLAUDE.md` states.
+
+These are not defects, and you do not record them: style, naming, a simpler way
+to write the same thing, a missing feature, a missing test, and a problem that
+was in the code before this commit and that the commit did not make worse.
+
+Record a defect only when you have read the code that shows it. Before you
+record one, read the code it depends on, such as the callers of a changed
+function and the types it uses. A commit can have no defects, and recording
+none is a correct outcome.
+
+## Identifier
+
+Pass this value, exactly as written, as `attachment_id` in every call to
+`list_files`, `read_file`, `search`, `claim`, and `guess`.
+
+- `attachment_id`: `{{ attachment_id }}`
+
+## The commit
+
+The commit message:
+
+<message>
+{{ message }}
+</message>
+
+The diff, with {{ context }} lines of unchanged text around each change:
+
+<diff>
+{{ diff }}
+</diff>
+
+## The repository
+
+The whole source tree as it was at this commit is available through three tools.
+
+- `list_files` lists the paths under a directory.
+- `read_file` returns a file, or a range of its lines, with line numbers.
+- `search` finds every line that holds a piece of text. The match is exact and
+  is not a pattern.
+{% if record %}
+
+## The session record
+
+A coding agent wrote this commit while working with a user. The record of that
+session, up to the moment of the commit, is available through the
+`mcp__gage__query` tool, which runs SQL. The record holds what the user asked
+for, what the agent thought and wrote, and every tool call the agent made with
+its result. It runs from line 1 to line {{ session_end }}.
+
+The record answers questions that the code cannot: what the user asked for, why
+the agent made a change, what the agent considered and rejected, and what it
+tested. Use it for those answers. The code itself is read with `read_file` and
+`search`, as described above.
+
+Work in this order.
+
+1. Read what the user asked for and what the agent said it did. The `message`
+   table has one row for each message, with the columns `line`, `type`,
+   `subtype`, and `text`. A `subtype` of `text` is what the user or the agent
+   wrote, and `thinking` is the agent's reasoning.
+2. Review the diff against the repository, as any reviewer would.
+3. For each change that looks wrong, risky, or unexplained, find the agent's
+   reason for it in the record. Search the `thinking` and `text` messages for
+   the names involved, and read the lines around each match.
+4. Find what the agent tested. The `tool_use` table has one row for each tool
+   call, with the columns `line`, `name`, `input_raw`, and `output`. Look for
+   the commands that ran tests or measurements, and note what no test covered.
+
+Filter every query by `session_id = '{{ session_id }}'`. A long `text` or
+`output` value is cut in the result, so select a part of it with `substr`, or
+select fewer rows.
+
+A reason in the record explains a change. It does not make the change correct.
+Record a defect when the code is wrong, whatever the record says about it.
+{% endif %}
+
+## Recording a defect
+
+Call `claim` once for each defect, with these inputs.
+
+- `file`: the path of the file that holds the defect.
+- `quote`: one line of that file, copied exactly, where the defect is. A quote
+  that is not found in the file is rejected, and you must correct it.
+- `line`: the number of that line, as `read_file` shows it. It is required only
+  when the quote is on more than one line of the file.
+- `severity`: one of `wrong-result`, `data-loss`, `unhandled-input`, or `rule`.
+- `description`: what is wrong, the input or state that shows it, and what
+  happens. Two to five sentences. For `rule`, name the rule.
+
+Record each defect once.
+
+## Guesses
+
+Call `guess` once for each place where you had to guess because these
+instructions did not say. Skip this step if there were none.
