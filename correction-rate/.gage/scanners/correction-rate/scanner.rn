@@ -1,0 +1,549 @@
+use gage::{
+    AgentRunner,
+    Input,
+    Mark,
+    Progress,
+    Target,
+    Template,
+    Tool,
+    call_agent,
+    carry_forward_notes,
+    params,
+    scan,
+    watermark,
+    write_note,
+};
+
+pub const SCANNER = #{
+    name: "correction-rate",
+    description: "How often the user corrects the model, by model",
+    params: #{
+        // Exchanges given to one labelling agent
+        batch: #{ value: 25 },
+        // Print each session's reply count and write nothing
+        dry_run: #{ value: false },
+    },
+    tasks: #{
+        label_sessions: #{
+            notes: #{
+                writes: #{
+                    "correction-rate[reviewed]":
+                        "One session's replies, counted by the scanner \
+                         with no model involved. A reply is a typed user \
+                         message that follows an assistant turn. The \
+                         target is the session. Metadata `models` holds, \
+                         for each model that the user replied to, the \
+                         counts `replies` and `interrupted`, the replies \
+                         that follow a user interrupt. `month` is the \
+                         month of the session's first reply, as in \
+                         `2026-05`, `project` is the session's \
+                         project, and `lines` is the range of session \
+                         lines that was reviewed.",
+                    "correction-rate[correction]":
+                        "A user reply that corrects the assistant, \
+                         labelled by an agent that read the end of the \
+                         assistant's turn and the reply. The text is one \
+                         sentence on what was corrected. The target is \
+                         the reply's session line. Metadata `line` is \
+                         that line and `kind` is `approach`, `factual`, \
+                         `overreach`, `instruction`, `quality`, or \
+                         `other`. The scanner adds `model`, the model \
+                         that was corrected, `month`, and `interrupted`.",
+                },
+            },
+        },
+        tally: #{
+            notes: #{
+                wants: [
+                    "correction-rate[reviewed]",
+                    "correction-rate[correction]",
+                ],
+                writes: #{
+                    "correction-rate[summary]":
+                        "The scan's totals. The text is the tables. \
+                         Metadata `models` holds, for each model, the \
+                         counts `sessions`, `replies`, `interrupted`, \
+                         and `corrections`, and `kinds`, the corrections \
+                         by kind. `months` holds `replies` and \
+                         `corrections` for each month and model. Every \
+                         number is counted by the scanner from the \
+                         reviewed and correction notes.",
+                },
+            },
+        },
+    },
+};
+
+const KEY = ("correction-rate", "label", 3);
+
+const INTERRUPT = "[Request interrupted by user";
+const KINDS = [
+    "approach",
+    "factual",
+    "overreach",
+    "instruction",
+    "quality",
+    "other",
+];
+
+// How much of each side of an exchange the agent is shown
+const ASSISTANT_HEAD = 300;
+const ASSISTANT_TAIL = 1500;
+const USER_MAX = 1500;
+
+pub async fn label_sessions() {
+    let t = Template::new(include_str!("label-prompt.md.j2"))?;
+    let batch = params().batch;
+    let dry_run = params().dry_run;
+
+    carry_forward_notes(KEY).await?;
+
+    let sessions = scan().sessions().unseen(KEY).await?;
+    let progress = Progress::new(sessions.len());
+    let agents = AgentRunner::new();
+    // The batches still running for each session. A session gets its
+    // reviewed note and is marked seen when its last batch is done, so
+    // a session with a failed batch has neither and is left out of the
+    // tally.
+    let pending = #{};
+
+    for (s, (start, end)) in sessions {
+        let session_id = s.id;
+        let exchanges = exchanges(s, start, end).await?;
+        if dry_run {
+            println!("{} lines {}-{}: {} replies", session_id, start, end, exchanges.len());
+            progress.tick();
+            continue;
+        }
+        let review = review(s, exchanges, start, end).await;
+
+        if exchanges.is_empty() {
+            finish(session_id.clone(), review).await?;
+            progress.tick();
+            continue;
+        }
+
+        let batches = 0;
+        let i = 0;
+        while i < exchanges.len() {
+            let chunk = [];
+            let j = i;
+            while j < exchanges.len() && j < i + batch {
+                chunk.push(exchanges[j]);
+                j += 1;
+            }
+            i = j;
+            let prompt = t.render(
+                #{ session_id: session_id.clone(), exchanges: chunk },
+            );
+            agents.add(
+                call_agent(prompt)
+                    .name("correction-rate-label")
+                    .tool(correction_tool())
+                    .model("medium"),
+                #{ session_id: session_id.clone() },
+            );
+            batches += 1;
+        }
+        pending.insert(session_id.clone(), #{ left: batches, review });
+    }
+
+    let results = agents.start();
+    while let Some(next) = results.next().await {
+        match next {
+            Ok((result, #{ session_id })) => {
+                log::info!(
+                    "agent result: {:?}",
+                    #{ session: session_id, result: result.text },
+                );
+                let p = pending[session_id.clone()];
+                p.left -= 1;
+                if p.left == 0 {
+                    finish(session_id.clone(), p.review).await?;
+                    progress.tick();
+                }
+            }
+            Err(err) => {
+                log::error!("agent error: {err:?}");
+            }
+        }
+    }
+}
+
+// The session's exchanges with a reply on lines `start` to `end`. An
+// exchange is a typed user message and the assistant text before it.
+// The first prompt of a session has no assistant text before it and
+// is not an exchange.
+async fn exchanges(s, start, end) {
+    let out = [];
+    let assistant = None;
+    let model = None;
+    let interrupted = false;
+
+    for m in s.messages().await {
+        if m.type == "assistant" {
+            if let Some(name) = m.model() {
+                if name != "<synthetic>" {
+                    model = Some(name);
+                }
+            }
+            if m.subtype == Some("text") && !m.text.trim().is_empty() {
+                assistant = Some(m.text);
+            }
+            continue;
+        }
+        if m.type != "user" || m.subtype != Some("text") {
+            continue;
+        }
+        let text = m.text.trim();
+        if text.starts_with(INTERRUPT) {
+            interrupted = true;
+            continue;
+        }
+        if !typed(text) {
+            continue;
+        }
+        if let (Some(last), Some(name)) = (assistant, model) {
+            if m.line >= start && m.line <= end {
+                out.push(
+                    #{
+                        line: m.line,
+                        model: name,
+                        month: m.timestamp.format("%Y-%m"),
+                        interrupted,
+                        assistant: ends(last),
+                        user: head(text, USER_MAX),
+                    },
+                );
+            }
+        }
+        interrupted = false;
+    }
+    Ok(out)
+}
+
+// Whether a user text message is one the user typed. The harness
+// writes the others: command output, notifications, and the summary
+// that opens a continued session.
+fn typed(text) {
+    !text.is_empty()
+        && !text.starts_with("<")
+        && !text.starts_with("Caveat: The messages below")
+        && !text.starts_with("This session is being continued")
+}
+
+// The first `n` characters of `text`
+fn head(text, n) {
+    let chars = text.chars().collect::<Vec>();
+    if chars.len() <= n {
+        return text;
+    }
+    let out = String::new();
+    for c in chars.iter().take(n) {
+        out.push(c);
+    }
+    out.push_str(" [...]");
+    out
+}
+
+// The start and the end of an assistant message. The end is what the
+// user replies to, so most of the allowance goes there.
+fn ends(text) {
+    let chars = text.chars().collect::<Vec>();
+    if chars.len() <= ASSISTANT_HEAD + ASSISTANT_TAIL {
+        return text;
+    }
+    let out = String::new();
+    for c in chars.iter().take(ASSISTANT_HEAD) {
+        out.push(c);
+    }
+    out.push_str("\n[...]\n");
+    for c in chars.iter().skip(chars.len() - ASSISTANT_TAIL) {
+        out.push(c);
+    }
+    out
+}
+
+// What the reviewed note of a session holds
+async fn review(s, exchanges, start, end) {
+    let models = #{};
+    let month = None;
+    for e in exchanges {
+        if month.is_none() {
+            month = Some(e.month);
+        }
+        let name = format!("{}", e.model);
+        if models.get(name).is_none() {
+            models.insert(name.clone(), #{ replies: 0, interrupted: 0 });
+        }
+        let m = models[name];
+        m.replies += 1;
+        if e.interrupted {
+            m.interrupted += 1;
+        }
+    }
+    #{
+        replies: exchanges.len(),
+        models,
+        month,
+        project: s.attrs().await.project,
+        lines: format!("{start}-{end}"),
+    }
+}
+
+// Write a session's reviewed note and mark the session seen
+async fn finish(session_id, review) {
+    write_note(
+        "correction-rate[reviewed]",
+        format!("{} replies", review.replies),
+    )
+        .target(Target::session(session_id.clone()))
+        .metadata(review)
+        .carry_forward(KEY)
+        .await?;
+    watermark(Mark::session(session_id), KEY).await?;
+    Ok(())
+}
+
+fn correction_tool() {
+    Tool::new("correction", write_correction)
+        .description("Record one user reply that corrects the assistant")
+        .input(Input::string("session_id").required())
+        .input(
+            Input::integer("line")
+                .description("The line number of the user reply")
+                .required(),
+        )
+        .input(
+            Input::string("kind")
+                .description(
+                    "approach, factual, overreach, instruction, quality, \
+                     or other",
+                )
+                .required(),
+        )
+        .input(
+            Input::string("summary")
+                .description("One sentence saying what was corrected")
+                .required(),
+        )
+}
+
+pub async fn write_correction(inputs) {
+    if !KINDS.iter().any(|k| k == inputs.kind) {
+        return Ok(format!("error: `{}` is not a kind", inputs.kind));
+    }
+    // The agent supplies only the line and the label. The model and
+    // the month come from the session, so a note cannot misstate them.
+    let exchange = None;
+    for s in scan().sessions().await {
+        if s.id == inputs.session_id {
+            for e in exchanges(s, 0, s.line_count).await? {
+                if e.line == inputs.line {
+                    exchange = Some(e);
+                }
+            }
+        }
+    }
+    let e = match exchange {
+        Some(e) => e,
+        None => {
+            return Ok(
+                format!(
+                    "error: line {} of `{}` is not a user reply of this scan",
+                    inputs.line,
+                    inputs.session_id,
+                ),
+            );
+        }
+    };
+    let note = write_note("correction-rate[correction]", inputs.summary)
+        .target(Target::session_line(inputs.session_id, e.line))
+        .metadata(
+            #{
+                line: e.line,
+                kind: inputs.kind,
+                model: e.model,
+                month: e.month,
+                interrupted: e.interrupted,
+            },
+        )
+        .carry_forward(KEY)
+        .await?;
+    Ok(format!("Wrote correction note {}", note.id))
+}
+
+/// Total the reviewed and correction notes and write one summary note.
+pub async fn tally() {
+    if params().dry_run {
+        return Ok(());
+    }
+    let models = #{};
+    let months = #{};
+
+    // The sessions that were reviewed in full. A correction counts
+    // only when its session is one of them.
+    let reviewed = #{};
+    for n in scan().notes().name("correction-rate[reviewed]").await? {
+        let meta = n.metadata;
+        let key = format!("{:?} {}", n.target, meta.lines);
+        if reviewed.get(key).is_some() {
+            continue;
+        }
+        reviewed.insert(key, true);
+        reviewed.insert(session_of(n.target), true);
+        for name in meta.models.keys() {
+            let counts = meta.models[name];
+            let m = model_row(models, format!("{}", name));
+            m.sessions += 1;
+            m.replies += counts.replies;
+            m.interrupted += counts.interrupted;
+            let r = month_row(
+                months,
+                format!("{}", meta.month),
+                format!("{}", name),
+            );
+            r.replies += counts.replies;
+        }
+    }
+
+    // An agent may record a reply twice. A reply counts once.
+    let seen = #{};
+    for n in scan().notes().name("correction-rate[correction]").await? {
+        let key = format!("{:?}", n.target);
+        if seen.get(key).is_some() {
+            continue;
+        }
+        seen.insert(key, true);
+        if reviewed.get(session_of(n.target)).is_none() {
+            continue;
+        }
+        let meta = n.metadata;
+        let kind = format!("{}", meta.kind);
+        let m = model_row(models, format!("{}", meta.model));
+        m.corrections += 1;
+        m.kinds.insert(kind.clone(), m.kinds.get(kind).unwrap_or(0) + 1);
+        let r = month_row(
+            months,
+            format!("{}", meta.month),
+            format!("{}", meta.model),
+        );
+        r.corrections += 1;
+    }
+
+    let names = models.keys().collect::<Vec>();
+    names.sort();
+
+    let lines = [
+        "| Model | Sessions | Replies | Corrections | Rate | After interrupt |",
+        "|---|---:|---:|---:|---:|---:|",
+    ];
+    for name in names {
+        let m = models[name];
+        lines.push(
+            format!(
+                "| {} | {} | {} | {} | {} | {} |",
+                name,
+                m.sessions,
+                m.replies,
+                m.corrections,
+                percent(m.corrections, m.replies),
+                percent(m.interrupted, m.replies),
+            ),
+        );
+    }
+
+    lines.push("");
+    let header = "| Model |";
+    let rule = "|---|";
+    for kind in KINDS {
+        header += format!(" {kind} |");
+        rule += "---:|";
+    }
+    lines.push(header);
+    lines.push(rule);
+    for name in names {
+        let m = models[name];
+        let row = format!("| {name} |");
+        for kind in KINDS {
+            row += format!(" {} |", m.kinds.get(kind).unwrap_or(0));
+        }
+        lines.push(row);
+    }
+
+    lines.push("");
+    lines.push("| Month | Model | Replies | Corrections | Rate |");
+    lines.push("|---|---|---:|---:|---:|");
+    let keys = months.keys().collect::<Vec>();
+    keys.sort();
+    for key in keys {
+        let r = months[key];
+        lines.push(
+            format!(
+                "| {} | {} | {} | {} | {} |",
+                r.month,
+                r.model,
+                r.replies,
+                r.corrections,
+                percent(r.corrections, r.replies),
+            ),
+        );
+    }
+
+    lines.push("");
+    lines.push("A reply is a typed user message that follows an assistant turn.");
+    lines.push("Rate is corrections over replies.");
+    lines.push("After interrupt is the share of replies that follow a user interrupt.");
+
+    let text = lines.join("\n");
+    println!("{text}");
+    let note = write_note("correction-rate[summary]", text)
+        .metadata(#{ models, months })
+        .await?;
+    log::info!("wrote summary note {}", note.id);
+}
+
+fn model_row(models, name) {
+    if models.get(name).is_none() {
+        models.insert(
+            name.clone(),
+            #{
+                sessions: 0,
+                replies: 0,
+                interrupted: 0,
+                corrections: 0,
+                kinds: #{},
+            },
+        );
+    }
+    models[name]
+}
+
+fn month_row(months, month, model) {
+    let key = format!("{} {}", month, model);
+    if months.get(key).is_none() {
+        months.insert(
+            key.clone(),
+            #{ month, model, replies: 0, corrections: 0 },
+        );
+    }
+    months[key]
+}
+
+// The session part of a note target, as in `session:<id>` for
+// `session:<id>#<line>`
+fn session_of(target) {
+    let target = format!("{}", target.unwrap_or(""));
+    match target.split('#').next() {
+        Some(session) => format!("{}", session),
+        None => target,
+    }
+}
+
+// `n` over `d` as a percentage with one decimal
+fn percent(n, d) {
+    if d == 0 {
+        return "-";
+    }
+    format!("{}%", (n as f64 * 1000.0 / d as f64).round() / 10.0)
+}

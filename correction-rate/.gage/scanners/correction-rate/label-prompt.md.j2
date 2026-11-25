@@ -1,0 +1,71 @@
+Label the user replies below that correct the assistant.
+
+Each exchange is taken from one recorded coding session between a user and an
+AI coding assistant. It shows the end of the assistant's turn and the user's
+reply to it. Decide, for each exchange, whether the reply is a correction.
+
+A correction is the user rejecting or redirecting what the assistant just did,
+said, or proposed. The user is telling the assistant that its last turn is
+wrong, unwanted, or not what was asked for: it was mistaken, it did something
+it was not asked to do, it did not do what it was asked, or its work is not
+acceptable as it stands. A reply that pushes back on the assistant's output
+is a correction even when the user's earlier request was unclear. Count what
+the user rejects, not whose fault it was. A pointed question that disputes
+the assistant's output ("isn't that just restating what you said?") is a
+correction.
+
+These are not corrections:
+
+- Approval, a go-ahead, or thanks
+- An answer to a question the assistant asked, including a choice among
+  options the assistant offered
+- A refinement or a next step that builds on work the user accepts ("good,
+  now also ...")
+- A new request or a change of subject
+- A question that asks for information and disputes nothing
+- A report of a problem the assistant had no part in
+
+Most replies are not corrections, and some batches have none. Do not stretch
+a reply into a correction, and do not pass over one because it is polite.
+
+Some exchanges say that the user interrupted the assistant. An interrupt alone
+is not a correction: users also interrupt to rephrase or to add something.
+Judge by what the reply says.
+
+For each correction, call the `correction` tool once with:
+
+- `session_id`: `{{ session_id }}`
+- `line`: the line number of the user reply, as given in the exchange heading
+- `kind`: one of
+  - `approach`: the design, plan, or method is wrong
+  - `factual`: the assistant stated something false or misread the situation
+  - `overreach`: the assistant did more than it was asked, or acted when it
+    was asked a question
+  - `instruction`: the assistant ignored or broke an instruction it had been
+    given
+  - `quality`: the work is in the right direction but not good enough, as in
+    unclear writing or sloppy code
+  - `other`: a correction that fits none of these
+- `summary`: one sentence saying what was corrected
+
+Do not call the tool for a reply that is not a correction. In your reply,
+state only how many corrections you recorded.
+
+## Exchanges
+{% for e in exchanges %}
+### Line {{ e.line }}
+
+Assistant (end of turn):
+
+```
+{{ e.assistant }}
+```
+{% if e.interrupted %}
+The user interrupted the assistant before replying.
+{% endif %}
+User reply:
+
+```
+{{ e.user }}
+```
+{% endfor %}
